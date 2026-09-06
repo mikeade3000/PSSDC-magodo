@@ -714,7 +714,7 @@ function renderAdmin() {
   const accountsCard = isSuper ? `
     <div class="card" style="border-color:var(--navy); ">
       <h2>Accounts &amp; access control</h2>
-      <div class="sub">All accounts in <strong>${escapeHtml(endpointLabel(state.activeDbUrl))}</strong> — admins, examiners and candidates. Lock an account to block it from signing in, or lock just an admin's access to the Audit Report. The super admin account cannot be locked.</div>
+      <div class="sub">Accounts in <strong>${escapeHtml(endpointLabel(state.activeDbUrl))}</strong> — admins, examiners and candidates. Locking or unlocking an account applies to that username across <strong>all databases</strong>, so the person is blocked (or restored) everywhere regardless of which database holds their login. The super admin account cannot be locked.</div>
       <button class="btn" id="loadAccountsBtn" style="margin-top:6px;">Load accounts</button>
       <div id="accountsResults" style="margin-top:14px;"></div>
     </div>` : '';
@@ -902,9 +902,9 @@ async function loadAccountsDashboard() {
     if (a.isSuperAdmin) {
       actions = '<span class="sub">protected</span>';
     } else {
-      actions = `<button class="btn btn-sm ${locked ? 'btn-gold' : 'btn-outline'} acct-lock-btn" data-uid="${escapeAttr(a.userId)}" data-field="locked" data-val="${locked ? '0' : '1'}">${locked ? 'Unlock sign-in' : 'Lock sign-in'}</button>`;
+      actions = `<button class="btn btn-sm ${locked ? 'btn-gold' : 'btn-outline'} acct-lock-btn" data-username="${escapeAttr(a.username)}" data-field="locked" data-val="${locked ? '0' : '1'}">${locked ? 'Unlock sign-in' : 'Lock sign-in'}</button>`;
       if (a.role === 'admin') {
-        actions += ` <button class="btn btn-sm ${a.auditLocked ? 'btn-gold' : 'btn-outline'} acct-lock-btn" data-uid="${escapeAttr(a.userId)}" data-field="auditLocked" data-val="${a.auditLocked ? '0' : '1'}" style="margin-left:6px;">${a.auditLocked ? 'Unlock audit' : 'Lock audit'}</button>`;
+        actions += ` <button class="btn btn-sm ${a.auditLocked ? 'btn-gold' : 'btn-outline'} acct-lock-btn" data-username="${escapeAttr(a.username)}" data-field="auditLocked" data-val="${a.auditLocked ? '0' : '1'}" style="margin-left:6px;">${a.auditLocked ? 'Unlock audit' : 'Lock audit'}</button>`;
       }
     }
 
@@ -923,20 +923,39 @@ async function loadAccountsDashboard() {
   box.querySelectorAll('.acct-lock-btn').forEach(btn => {
     btn.onclick = async () => {
       btn.disabled = true;
-      const res = await apiPost('setAccountLock', {
-        userId: btn.dataset.uid,
-        field: btn.dataset.field,
-        value: btn.dataset.val === '1'
-      });
-      if (res && res.success) {
-        const what = btn.dataset.field === 'auditLocked' ? 'Audit access' : 'Sign-in';
-        const how = btn.dataset.val === '1' ? 'locked' : 'unlocked';
-        audit('account_lock_change', `${what} ${how} for account ${btn.dataset.uid} in ${endpointLabel(state.activeDbUrl)}`);
-        loadAccountsDashboard(); // refresh
-      } else {
-        btn.disabled = false;
-        msg('acctLockMsg', (res && res.error) || 'Could not update this account.', true);
+      const username = btn.dataset.username;
+      const field = btn.dataset.field;
+      const value = btn.dataset.val === '1';
+      const eps = configuredEndpoints();
+
+      msg('acctLockMsg', `Applying across ${eps.length} database(s)…`, false);
+
+      // Apply the same lock to EVERY configured database by username, so the
+      // person is locked/unlocked everywhere regardless of which database
+      // holds their login. Each database reports how many rows it matched.
+      let totalMatched = 0, dbsWithMatch = 0, failures = 0;
+      for (const ep of eps) {
+        try {
+          const res = await apiPostOn(ep.url, 'setAccountLockByUsername', { username, field, value });
+          if (res && res.success) {
+            const m = Number(res.matchedCount || res.matched || 0);
+            if (m > 0) { totalMatched += m; dbsWithMatch++; }
+          } else {
+            failures++;
+          }
+        } catch (e) {
+          failures++;
+        }
       }
+
+      const what = field === 'auditLocked' ? 'Audit access' : 'Sign-in';
+      const how = value ? 'locked' : 'unlocked';
+      audit('account_lock_change', `${what} ${how} for username "${username}" across all databases (${dbsWithMatch} database(s), ${totalMatched} account(s))`);
+
+      let note = `${what} ${how} for "${username}" in ${dbsWithMatch} database(s) (${totalMatched} account${totalMatched === 1 ? '' : 's'}).`;
+      if (failures) note += ` ${failures} database(s) could not be reached — retry to apply there too.`;
+      msg('acctLockMsg', note, failures > 0);
+      loadAccountsDashboard(); // refresh the current DB's view
     };
   });
 }
@@ -2185,7 +2204,7 @@ function setRecordingHealth(status) {
 // through the exact same pipeline real exam chunks use. Returns {ok, reason}.
 // This proves camera capture, encoding, base64 transport, Apps Script, and
 // Drive write all work end-to-end before the exam is allowed to begin.
-const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.2';
+const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.3';
 
 async function runRecordingPreflight() {
   // Step 1: confirm the LIVE backend is running current code. A stale
