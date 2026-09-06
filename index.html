@@ -1449,7 +1449,7 @@ function attachExaminerHandlers() {
 
     html += '<div class="card"><h2>Proctoring recordings</h2>';
     if (recordingsRes.success && recordingsRes.recordings && recordingsRes.recordings.length) {
-      html += `<div class="sub">All candidates' full session recordings for this exam, downloaded as ONE ZIP file directly — no Google Drive visit needed. Inside the ZIP, every candidate has their own folder containing their segments. Large exams have many segments, so allow the progress counter to finish.</div>`;
+      html += `<div class="sub">All candidates' full session recordings for this exam, downloaded as ONE ZIP file directly. Inside the ZIP, every candidate has their own folder containing their segments. Large exams have many segments, so allow the progress counter to finish.</div>`;
       html += '<button class="btn btn-gold btn-sm" id="downloadAllRecBtn" style="margin-bottom:14px;">Download ALL recordings for this exam (ZIP)</button>';
       html += '<table><tr><th>Candidate</th><th>Segments</th><th>Recorded from</th><th>Until</th></tr>';
       recordingsRes.recordings.forEach(rec => {
