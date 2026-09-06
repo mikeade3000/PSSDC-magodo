@@ -710,9 +710,19 @@ function renderAdmin() {
       <div class="sub" id="adminDbCurrent" style="margin-top:10px;">Currently managing: <strong>${escapeHtml(endpointLabel(state.activeDbUrl))}</strong></div>
     </div>` : '';
 
+  const isSuper = state.user && (state.user.isSuperAdmin || state.bootstrapMode);
+  const accountsCard = isSuper ? `
+    <div class="card" style="border-color:var(--navy); ">
+      <h2>Accounts &amp; access control</h2>
+      <div class="sub">All accounts in <strong>${escapeHtml(endpointLabel(state.activeDbUrl))}</strong> — admins, examiners and candidates. Lock an account to block it from signing in, or lock just an admin's access to the Audit Report. The super admin account cannot be locked.</div>
+      <button class="btn" id="loadAccountsBtn" style="margin-top:6px;">Load accounts</button>
+      <div id="accountsResults" style="margin-top:14px;"></div>
+    </div>` : '';
+
   return `
     ${banner}
     ${dbSelector}
+    ${accountsCard}
     <div class="grid-2">
       <div class="card">
         <h2>Create user account</h2>
@@ -807,13 +817,18 @@ function renderAdmin() {
       <div id="questionBulkMsg"></div>
     </div>
 
+    ${state.user && state.user.auditLocked && !state.user.isSuperAdmin ? `
+    <div class="card">
+      <h2>Audit report</h2>
+      <div class="error-msg">Your access to the Audit Report has been locked by the super administrator.</div>
+    </div>` : `
     <div class="card">
       <h2>Audit report</h2>
       <div class="sub">Every access and action across the app — sign-ins/outs, device &amp; OS, in-app movement, exam start/submit, and lockdown breach attempts. Newest first.</div>
       <button class="btn" id="loadAuditBtn" style="margin-top:6px;">Load audit report</button>
       <button class="btn btn-outline btn-sm" id="downloadAuditBtn" style="margin-top:6px; margin-left:8px;">Download audit (CSV)</button>
       <div id="auditResults" style="margin-top:14px;"></div>
-    </div>
+    </div>`}
 
     <div class="card">
       <h2>Assign candidate to exam</h2>
@@ -855,6 +870,77 @@ function renderAdmin() {
   `;
 }
 
+// Super-admin accounts dashboard: lists every account in the selected
+// database with lock / unlock controls (sign-in lock, and per-admin audit lock).
+async function loadAccountsDashboard() {
+  const box = document.getElementById('accountsResults');
+  if (!box) return;
+  box.innerHTML = '<div class="empty-state">Loading accounts…</div>';
+  const r = await apiGet('listAccounts', {});
+  if (!r || !r.success || !r.accounts) { box.innerHTML = '<div class="error-msg">Could not load accounts from this database.</div>'; return; }
+  if (!r.accounts.length) { box.innerHTML = '<div class="empty-state">No accounts in this database yet.</div>'; return; }
+
+  const roleOrder = { admin: 0, examiner: 1, candidate: 2 };
+  const accounts = r.accounts.slice().sort((a, b) =>
+    (roleOrder[a.role] ?? 3) - (roleOrder[b.role] ?? 3) || String(a.fullName).localeCompare(String(b.fullName)));
+
+  let html = '<div class="preview-wrap"><table><tr><th>Name</th><th>Username</th><th>Role</th><th>Sign-in</th><th>Audit access</th><th>Actions</th></tr>';
+  accounts.forEach(a => {
+    const locked = a.locked;
+    const signinBadge = a.isSuperAdmin
+      ? '<span class="badge badge-ok">super admin</span>'
+      : (locked ? '<span class="badge badge-danger">locked</span>' : '<span class="badge badge-ok">active</span>');
+    // Audit lock only meaningful for admins (only admins can view the report).
+    let auditCell = '—';
+    if (a.role === 'admin' && !a.isSuperAdmin) {
+      auditCell = a.auditLocked ? '<span class="badge badge-danger">locked</span>' : '<span class="badge badge-ok">allowed</span>';
+    } else if (a.isSuperAdmin) {
+      auditCell = '<span class="badge badge-ok">always</span>';
+    }
+
+    let actions = '';
+    if (a.isSuperAdmin) {
+      actions = '<span class="sub">protected</span>';
+    } else {
+      actions = `<button class="btn btn-sm ${locked ? 'btn-gold' : 'btn-outline'} acct-lock-btn" data-uid="${escapeAttr(a.userId)}" data-field="locked" data-val="${locked ? '0' : '1'}">${locked ? 'Unlock sign-in' : 'Lock sign-in'}</button>`;
+      if (a.role === 'admin') {
+        actions += ` <button class="btn btn-sm ${a.auditLocked ? 'btn-gold' : 'btn-outline'} acct-lock-btn" data-uid="${escapeAttr(a.userId)}" data-field="auditLocked" data-val="${a.auditLocked ? '0' : '1'}" style="margin-left:6px;">${a.auditLocked ? 'Unlock audit' : 'Lock audit'}</button>`;
+      }
+    }
+
+    html += `<tr>
+      <td>${escapeHtml(a.fullName || '—')}</td>
+      <td>${escapeHtml(a.username || '—')}</td>
+      <td>${escapeHtml(a.role || '—')}</td>
+      <td>${signinBadge}</td>
+      <td>${auditCell}</td>
+      <td>${actions}</td>
+    </tr>`;
+  });
+  html += '</table></div><div id="acctLockMsg" style="margin-top:10px;"></div>';
+  box.innerHTML = html;
+
+  box.querySelectorAll('.acct-lock-btn').forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      const res = await apiPost('setAccountLock', {
+        userId: btn.dataset.uid,
+        field: btn.dataset.field,
+        value: btn.dataset.val === '1'
+      });
+      if (res && res.success) {
+        const what = btn.dataset.field === 'auditLocked' ? 'Audit access' : 'Sign-in';
+        const how = btn.dataset.val === '1' ? 'locked' : 'unlocked';
+        audit('account_lock_change', `${what} ${how} for account ${btn.dataset.uid} in ${endpointLabel(state.activeDbUrl)}`);
+        loadAccountsDashboard(); // refresh
+      } else {
+        btn.disabled = false;
+        msg('acctLockMsg', (res && res.error) || 'Could not update this account.', true);
+      }
+    };
+  });
+}
+
 function attachAdminHandlers() {
   const dbSel = document.getElementById('adminDbSelect');
   if (dbSel) {
@@ -867,6 +953,9 @@ function attachAdminHandlers() {
       render();
     };
   }
+
+  const loadAccountsBtn = document.getElementById('loadAccountsBtn');
+  if (loadAccountsBtn) loadAccountsBtn.onclick = () => loadAccountsDashboard();
 
   document.getElementById('createUserBtn').onclick = async () => {
     const payload = {
@@ -928,10 +1017,15 @@ function attachAdminHandlers() {
   };
 
   let auditCache = null;
-  document.getElementById('loadAuditBtn').onclick = async () => {
+  const loadAuditBtn = document.getElementById('loadAuditBtn');
+  if (loadAuditBtn) loadAuditBtn.onclick = async () => {
     const box = document.getElementById('auditResults');
     box.innerHTML = '<div class="empty-state">Loading…</div>';
-    const r = await apiGet('getAuditReport', { limit: 500 });
+    const r = await apiGet('getAuditReport', { limit: 500, requesterUserId: state.user.userId });
+    if (r && r.success === false && r.auditLocked) {
+      box.innerHTML = '<div class="error-msg">Your access to the Audit Report has been locked by the super administrator.</div>';
+      return;
+    }
     auditCache = r;
     if (!r.success || !r.audit || !r.audit.length) { box.innerHTML = '<div class="empty-state">No audit records yet.</div>'; return; }
 
@@ -967,9 +1061,11 @@ function attachAdminHandlers() {
     box.innerHTML = html;
   };
 
-  document.getElementById('downloadAuditBtn').onclick = async () => {
+  const downloadAuditBtn = document.getElementById('downloadAuditBtn');
+  if (downloadAuditBtn) downloadAuditBtn.onclick = async () => {
     let r = auditCache;
-    if (!r) r = await apiGet('getAuditReport', { limit: 5000 });
+    if (!r) r = await apiGet('getAuditReport', { limit: 5000, requesterUserId: state.user.userId });
+    if (r && r.success === false && r.auditLocked) { msg('resetAttemptMsg', 'Your access to the Audit Report has been locked by the super administrator.', true); return; }
     if (!r.success || !r.audit || !r.audit.length) { msg('resetAttemptMsg', 'No audit records to download.', true); return; }
     const header = ['timestamp', 'userId', 'username', 'role', 'event', 'detail', 'examId', 'os', 'browser', 'screen', 'userAgent'];
     const lines = [header.join(',')];
@@ -2089,7 +2185,7 @@ function setRecordingHealth(status) {
 // through the exact same pipeline real exam chunks use. Returns {ok, reason}.
 // This proves camera capture, encoding, base64 transport, Apps Script, and
 // Drive write all work end-to-end before the exam is allowed to begin.
-const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.1';
+const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.2';
 
 async function runRecordingPreflight() {
   // Step 1: confirm the LIVE backend is running current code. A stale
