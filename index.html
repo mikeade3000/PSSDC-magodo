@@ -390,6 +390,7 @@ const state = {
   currentView: 'login',
   homeEndpoint: null,   // the DB endpoint this account authenticated against
   activeDbUrl: null,    // DB the admin has selected to work on (admins only)
+  examinerDbUrl: null,  // DB the examiner has selected to view (examiners only)
   exam: null,
   questions: [],
   answers: {},          // questionId -> answer value
@@ -670,6 +671,10 @@ function routeToRoleHome() {
     if (state.activeDbUrl) setActiveEndpoint(state.activeDbUrl);
     state.currentView = 'admin';
   } else if (state.user.role === 'examiner') {
+    // Examiner reviews one database at a time; default to the one they logged
+    // in against (or the first configured), then free to switch via the selector.
+    if (!state.examinerDbUrl) state.examinerDbUrl = state.homeEndpoint || (configuredEndpoints()[0] || {}).url || ACTIVE_ENDPOINT;
+    if (state.examinerDbUrl) setActiveEndpoint(state.examinerDbUrl);
     state.currentView = 'examiner';
   } else {
     state.currentView = 'candidateHome';
@@ -820,7 +825,7 @@ function renderAdmin() {
     ${state.user && state.user.auditLocked && !state.user.isSuperAdmin ? `
     <div class="card">
       <h2>Audit report</h2>
-      <div class="error-msg">Your access to the Audit Report is via a 3rd Party</div>
+      <div class="error-msg">Your access to the Audit Report has been locked by the super administrator.</div>
     </div>` : `
     <div class="card">
       <h2>Audit report</h2>
@@ -1369,7 +1374,20 @@ function msg(id, text, isError) {
 
 // ---------- EXAMINER VIEW ----------
 function renderExaminer() {
+  const eps = configuredEndpoints();
+  const dbSelector = eps.length > 1 ? `
+    <div class="card" style="border-color:var(--gold); background:rgba(184,134,11,0.06);">
+      <h2>Working database</h2>
+      <div class="sub">Choose which database to review. Exams, results, recordings, snapshots and violations all load from the database you select here \u2014 pick the one where the exam was taken.</div>
+      <label>Database</label>
+      <select id="examinerDbSelect">
+        ${eps.map(e => `<option value="${escapeAttr(e.url)}" ${e.url === state.examinerDbUrl ? 'selected' : ''}>${escapeHtml(e.label)}</option>`).join('')}
+      </select>
+      <div class="sub" style="margin-top:10px;">Currently reviewing: <strong>${escapeHtml(endpointLabel(state.examinerDbUrl))}</strong></div>
+    </div>` : '';
+
   return `
+    ${dbSelector}
     <div class="card">
       <h2>Monitor exam</h2>
       <div class="sub">Enter an exam ID to view every exam taker's status, score, and proctoring record — with a suggested action for each. All suggestions are advisory only; the decision on any sitting rests with you as the examiner.</div>
@@ -1396,7 +1414,23 @@ function csvEscape(value) {
 }
 
 function attachExaminerHandlers() {
+  const dbSel = document.getElementById('examinerDbSelect');
+  if (dbSel) {
+    dbSel.onchange = () => {
+      state.examinerDbUrl = dbSel.value;
+      setActiveEndpoint(state.examinerDbUrl);
+      audit('examiner_db_switch', 'Switched review database to ' + endpointLabel(state.examinerDbUrl));
+      // Clear any results loaded from the previous database and re-render.
+      const rb = document.getElementById('monitorResults');
+      if (rb) rb.innerHTML = '';
+      render();
+    };
+  }
+
   document.getElementById('loadMonitorBtn').onclick = async () => {
+    // Ensure calls hit the database the examiner has selected (belt-and-braces
+    // in case anything else changed the active endpoint since render).
+    if (state.examinerDbUrl) setActiveEndpoint(state.examinerDbUrl);
     const examId = val('monitorExamId');
     if (!examId) return;
     const resultsBody = document.getElementById('monitorResults');
@@ -1449,7 +1483,7 @@ function attachExaminerHandlers() {
 
     html += '<div class="card"><h2>Proctoring recordings</h2>';
     if (recordingsRes.success && recordingsRes.recordings && recordingsRes.recordings.length) {
-      html += `<div class="sub">All candidates' full session recordings for this exam, downloaded as ONE ZIP file directly. Inside the ZIP, every candidate has their own folder containing their segments. Large exams have many segments, so allow the progress counter to finish.</div>`;
+      html += `<div class="sub">All candidates' full session recordings for this exam, downloaded as ONE ZIP file directly — no Google Drive visit needed. Inside the ZIP, every candidate has their own folder containing their segments. Large exams have many segments, so allow the progress counter to finish.</div>`;
       html += '<button class="btn btn-gold btn-sm" id="downloadAllRecBtn" style="margin-bottom:14px;">Download ALL recordings for this exam (ZIP)</button>';
       html += '<table><tr><th>Candidate</th><th>Segments</th><th>Recorded from</th><th>Until</th></tr>';
       recordingsRes.recordings.forEach(rec => {
@@ -2204,7 +2238,7 @@ function setRecordingHealth(status) {
 // through the exact same pipeline real exam chunks use. Returns {ok, reason}.
 // This proves camera capture, encoding, base64 transport, Apps Script, and
 // Drive write all work end-to-end before the exam is allowed to begin.
-const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.3';
+const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.4';
 
 async function runRecordingPreflight() {
   // Step 1: confirm the LIVE backend is running current code. A stale
