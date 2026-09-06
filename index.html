@@ -713,6 +713,10 @@ function renderAdmin() {
         ${eps.map(e => `<option value="${escapeAttr(e.url)}" ${e.url === state.activeDbUrl ? 'selected' : ''}>${escapeHtml(e.label)}</option>`).join('')}
       </select>
       <div class="sub" id="adminDbCurrent" style="margin-top:10px;">Currently managing: <strong>${escapeHtml(endpointLabel(state.activeDbUrl))}</strong></div>
+      <hr style="border:none; border-top:1px solid #e2e2e2; margin:14px 0;" />
+      <div class="sub">Confirm every database is reachable and running the expected version.</div>
+      <button class="btn btn-outline btn-sm" id="checkAllDbsBtn" style="margin-top:6px;">Check all databases</button>
+      <div id="dbHealthResults" style="margin-top:12px;"></div>
     </div>` : '';
 
   const isSuper = state.user && (state.user.isSuperAdmin || state.bootstrapMode);
@@ -875,6 +879,66 @@ function renderAdmin() {
   `;
 }
 
+// Pings every configured database and shows each one's reachability and
+// backend version at a glance, so confirming six deployments is one click.
+async function checkAllDatabases() {
+  const box = document.getElementById('dbHealthResults');
+  if (!box) return;
+  const eps = configuredEndpoints();
+  if (!eps.length) { box.innerHTML = '<div class="empty-state">No databases configured.</div>'; return; }
+  box.innerHTML = `<div class="empty-state">Checking ${eps.length} database(s)…</div>`;
+
+  const required = (typeof REQUIRED_BACKEND_VERSION_PREFIX !== 'undefined') ? REQUIRED_BACKEND_VERSION_PREFIX : '';
+
+  const results = await Promise.all(eps.map(async (ep) => {
+    const started = Date.now();
+    try {
+      const res = await apiGetOn(ep.url, 'ping', {});
+      const ms = Date.now() - started;
+      if (res && res.success) {
+        const ver = res.version || '(no version)';
+        const ok = required && String(ver).indexOf(required) === 0;
+        return { label: ep.label, reachable: true, version: ver, ok: ok, ms };
+      }
+      return { label: ep.label, reachable: true, version: (res && res.version) || '(no version)', ok: false, ms, note: 'responded without success' };
+    } catch (e) {
+      return { label: ep.label, reachable: false, version: '—', ok: false, ms: Date.now() - started, note: 'unreachable' };
+    }
+  }));
+
+  let allGood = true;
+  let html = `<div class="sub">Expected version prefix: <strong>${escapeHtml(required || 'n/a')}</strong></div>`;
+  html += '<div class="preview-wrap"><table><tr><th>Database</th><th>Status</th><th>Version</th><th>Response</th></tr>';
+  results.forEach(r => {
+    let statusBadge, versionBadge;
+    if (!r.reachable) {
+      statusBadge = '<span class="badge badge-danger">unreachable</span>';
+      versionBadge = '—';
+      allGood = false;
+    } else if (r.ok) {
+      statusBadge = '<span class="badge badge-ok">online</span>';
+      versionBadge = `<span class="badge badge-ok">${escapeHtml(r.version)}</span>`;
+    } else {
+      statusBadge = '<span class="badge badge-warn">online</span>';
+      versionBadge = `<span class="badge badge-warn">${escapeHtml(r.version)} — update needed</span>`;
+      allGood = false;
+    }
+    html += `<tr>
+      <td>${escapeHtml(r.label)}</td>
+      <td>${statusBadge}</td>
+      <td>${versionBadge}</td>
+      <td>${r.reachable ? r.ms + ' ms' : escapeHtml(r.note || 'no response')}</td>
+    </tr>`;
+  });
+  html += '</table></div>';
+  html += allGood
+    ? '<div class="sub" style="color:var(--success); margin-top:8px;"><strong>All databases are online and on the expected version.</strong></div>'
+    : '<div class="sub" style="color:#B8860B; margin-top:8px;"><strong>One or more databases need attention</strong> — deploy the latest Code.gs (new version) to any marked “update needed”, and check any marked “unreachable”.</div>';
+  box.innerHTML = html;
+
+  audit('db_health_check', `Checked ${eps.length} database(s); ${allGood ? 'all healthy' : 'issues found'}`);
+}
+
 // Super-admin accounts dashboard: lists every account in the selected
 // database with lock / unlock controls (sign-in lock, and per-admin audit lock).
 async function loadAccountsDashboard() {
@@ -980,6 +1044,9 @@ function attachAdminHandlers() {
 
   const loadAccountsBtn = document.getElementById('loadAccountsBtn');
   if (loadAccountsBtn) loadAccountsBtn.onclick = () => loadAccountsDashboard();
+
+  const checkDbsBtn = document.getElementById('checkAllDbsBtn');
+  if (checkDbsBtn) checkDbsBtn.onclick = () => checkAllDatabases();
 
   document.getElementById('createUserBtn').onclick = async () => {
     const payload = {
