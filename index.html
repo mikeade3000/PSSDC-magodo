@@ -1808,10 +1808,7 @@ function attachCandidateHomeHandlers() {
 
 // ---------- PERMISSION GATE (consent -> snapshots -> preflight) ----------
 const SNAPSHOT_SLOTS = [
-  { key: 'face', label: 'Your face' },
-  { key: 'system_back', label: 'Back of your system' },
-  { key: 'right_side', label: 'Right side of your location' },
-  { key: 'left_side', label: 'Left side of your location' }
+  { key: 'face', label: 'Your face' }
 ];
 
 function renderPermissionGate() {
@@ -1823,7 +1820,7 @@ function renderPermissionGate() {
         <h2>Consent required before this exam</h2>
         <p>${escapeHtml(state.exam.title)} is a proctored examination. Before proceeding, you must consent to ALL of the following being collected and used for examination-integrity purposes:</p>
         <ul class="gate-list">
-          <li><strong>Pictures:</strong> snapshots of you and your surroundings, taken before the exam begins.</li>
+          <li><strong>Pictures:</strong> a photo of your face, taken before the exam begins.</li>
           <li><strong>Video recording:</strong> your camera is recorded for the full duration of the exam.</li>
           <li><strong>Audio recording:</strong> your microphone is recorded for the full duration of the exam.</li>
           <li><strong>Geographical location:</strong> your location at the time of the exam is captured once.</li>
@@ -1855,12 +1852,12 @@ function renderSnapshotStep() {
   return `
     <div class="gate-overlay">
       <div class="gate-card snap-card">
-        <h2>Pre-exam snapshots</h2>
-        <p class="snap-intro">Using your camera, capture the four required snapshots. Position the camera (or turn your device) so each shot clearly shows what is asked, then press Capture.</p>
+        <h2>Pre-exam photo</h2>
+        <p class="snap-intro">Look directly into your camera and capture a clear photo of your face. If it is blurred or off-centre, use Retake, then continue.</p>
         <video id="snapVideo" class="snap-video" autoplay muted playsinline></video>
         <div class="snap-grid">${slots}</div>
         ${allCaptured
-          ? `<button class="btn btn-gold" id="submitSnapshotsBtn" style="width:100%;">Submit snapshots &amp; continue to exam</button>`
+          ? `<button class="btn btn-gold" id="submitSnapshotsBtn" style="width:100%;">Continue to exam</button>`
           : `<button class="btn btn-gold" id="captureSnapBtn" style="width:100%;">Capture: ${escapeHtml(nextSlot.label)}</button>`}
         <div id="gateError" style="margin-top:8px;"></div>
       </div>
@@ -2587,24 +2584,43 @@ function autoSubmit() {
 }
 
 async function submitExam() {
+  // Guard against double-submission (e.g. rapid clicks, or timer + manual).
+  if (state.examSubmitted) return;
+
+  // ---- INSTANT LOCK (happens synchronously, before any network call) ----
+  // The moment Submit is clicked or the timer expires, the exam is locked and
+  // the confirmation screen is shown immediately. This does NOT wait on the
+  // server, so a slow or dropped connection can never leave the exam open and
+  // answerable during the submit delay. Answers are frozen at this instant;
+  // nothing entered afterwards can count.
   state.examSubmitted = true;
-  stopAllTimers();
+  persistCurrentAnswer();               // capture the answer on the current question
+  stopAllTimers();                      // freeze the timer
   detachProctoringListeners();
+  disengageLockdown();                  // release key/clipboard traps (exam is over)
+  const answersSnapshot = Object.entries(state.answers).map(([questionId, answer]) => ({ questionId, answer }));
 
-  const answers = Object.entries(state.answers).map(([questionId, answer]) => ({ questionId, answer }));
-  try {
-    await apiPost('submitFinalAnswers', { examId: state.exam.examId, candidateId: state.user.userId, answers });
-  } catch (e) { /* local copy retained in localStorage regardless */ }
-
-  stopRecording();
-  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
-
-  localStorage.removeItem(LOCAL_KEY_PREFIX + state.exam.examId + '_' + state.user.userId);
-
-  audit('exam_submitted', 'Exam submitted; lockdown released', state.exam.examId);
-  disengageLockdown();
+  // Show the locked confirmation screen right away.
   state.currentView = 'examSubmitted';
   render();
+
+  // Leave fullscreen (cosmetic; safe if it fails).
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+
+  // ---- BACKGROUND FINALISATION (may take time on a slow link) ----
+  // Runs after the candidate is already locked out, so its speed is irrelevant
+  // to integrity. The local copy is retained until the server confirms.
+  try {
+    await apiPost('submitFinalAnswers', { examId: state.exam.examId, candidateId: state.user.userId, answers: answersSnapshot });
+    localStorage.removeItem(LOCAL_KEY_PREFIX + state.exam.examId + '_' + state.user.userId);
+  } catch (e) {
+    // Sync failed (e.g. connection dropped). The answers remain saved locally
+    // and the session will be finalised server-side when time expires or on a
+    // later sync; the candidate stays locked out either way.
+  }
+
+  stopRecording();
+  audit('exam_submitted', 'Exam submitted and locked', state.exam.examId);
 }
 
 function stopAllTimers() {
@@ -2721,8 +2737,8 @@ function renderSubmitted() {
   return `
     <div class="card" style="text-align:center; padding:50px 20px;">
       <div style="font-size:40px;">✅</div>
-      <h2>Exam submitted</h2>
-      <p class="sub">Your responses have been recorded. You may now close this window.</p>
+      <h2>Your exam has been submitted and locked</h2>
+      <p class="sub">You can no longer make changes. Your responses are saved and are being finalised — this may take a moment on a slow connection, but it is safe to wait or close this window; nothing further is required from you.</p>
     </div>
   `;
 }
