@@ -343,6 +343,7 @@ function routeUsernameToEndpoints(username) {
 const RECORDING_CHUNK_SECONDS = 15;   // how often a video chunk is finalized and uploaded (kept short so each upload is small and survives weak connections)
 const ANSWER_SYNC_INTERVAL_MS = 20000; // batch-sync answers to backend every 20s
 const HEARTBEAT_INTERVAL_MS = 45000;
+const EXAM_STOP_POLL_MS = 20000; // how often a sitting candidate checks if the exam was stopped by an admin
 // Candidate-conduct violations (tab switch, fullscreen exit, window blur) are
 // counted and logged so the examiner can weigh them when reviewing the sitting.
 // They carry NO automatic penalty for the candidate — recommended actions are
@@ -412,6 +413,8 @@ const state = {
   timerHandle: null,
   syncHandle: null,
   heartbeatHandle: null,
+  examStopPollHandle: null,
+  examEndedByStop: false,
   mediaStream: null,
   mediaRecorder: null,
   recordedChunks: [],
@@ -877,6 +880,24 @@ function renderAdmin() {
       <div id="resetAttemptMsg"></div>
     </div>
 
+    <div class="card" style="border-color:#B00020;">
+      <h2>Stop exam</h2>
+      <div class="sub">Ends an exam immediately \u2014 for example at a fixed cut-off time. Any candidate still sitting is notified on their screen that the exam has ended, and everything they have attempted is harvested and marked submitted for grading. No new attempts can start afterwards. This cannot be undone.</div>
+      <label>Exam ID</label>
+      <input type="text" id="stopExamId" placeholder="Paste the exam ID to stop" />
+      <div style="margin-top:12px;">
+        <button class="btn" id="stopExamBtn" style="background:#B00020; border-color:#B00020;">Stop this exam now</button>
+      </div>
+      <div id="stopExamResults" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Deployment safety check</h2>
+      <div class="sub">Before deploying a new backend version to a database, check whether anyone is sitting an exam on it right now. A database is safe to update only when it shows <strong>idle</strong>. Databases still on an older version can't report activity and are shown as such \u2014 treat those as busy unless you know no exam is scheduled.</div>
+      <button class="btn btn-outline btn-sm" id="deploySafetyBtn" style="margin-top:6px;">Check which databases are idle</button>
+      <div id="deploySafetyResults" style="margin-top:12px;"></div>
+    </div>
+
     <div class="card">
       <h2>Recover stuck sessions</h2>
       <div class="sub">If a candidate finished but a poor connection stopped their submission from registering, or their connection dropped mid-exam and never returned, their session can stay marked "in progress". This finalises such sessions using the answers they had already synced. It only ever touches sessions whose exam time is already up \u2014 it can never disturb a candidate who is still genuinely sitting.</div>
@@ -1126,7 +1147,12 @@ function attachAdminHandlers() {
     if (!examId) { box.innerHTML = '<div class="error-msg">Enter an exam ID first.</div>'; return; }
     box.innerHTML = '<div class="empty-state">Checking…</div>';
     const r = await apiGet('getStaleSessions', { examId });
-    if (!r || !r.success) { box.innerHTML = '<div class="error-msg">Could not check this exam in the current database.</div>'; return; }
+    if (!r || !r.success) {
+      const reason = (r && r.error) ? r.error : 'No response from the selected database.';
+      const stale = /Unknown (POST|GET) action/i.test(reason);
+      box.innerHTML = `<div class="error-msg">Could not check this exam: ${escapeHtml(reason)}${stale ? '<br><br>This database is running an older version. Deploy the latest Code.gs (new version) to it, then try again.' : ''}</div>`;
+      return;
+    }
     if (!r.count) { box.innerHTML = '<div class="sub" style="color:var(--success);">No stuck sessions — every in-progress session for this exam is either still live or already submitted.</div>'; return; }
     let html = `<div class="sub"><strong>${r.count}</strong> stuck session(s) found (exam time already elapsed):</div>`;
     html += '<div class="preview-wrap"><table><tr><th>Candidate</th><th>Started</th><th>Silent for</th></tr>';
@@ -1150,8 +1176,76 @@ function attachAdminHandlers() {
       audit('finalize_stale_sessions', `Finalised ${r.finalised} stuck session(s) for ${examId}`);
       box.innerHTML = `<div class="sub" style="color:var(--success);"><strong>${r.finalised}</strong> session(s) finalised and marked submitted. Reload the exam in the Examiner view to see them.</div>`;
     } else {
-      box.innerHTML = '<div class="error-msg">Could not finalise sessions in the current database.</div>';
+      // Show the real reason so the cause is visible rather than guessed. The
+      // most common is a database still running an older backend that doesn't
+      // know this action — its message names the unknown action.
+      const reason = (r && r.error) ? r.error : 'No response from the selected database.';
+      const stale = /Unknown (POST|GET) action/i.test(reason);
+      box.innerHTML = `<div class="error-msg">Could not finalise sessions: ${escapeHtml(reason)}${stale ? '<br><br>This database is running an older version that does not support this feature yet. Deploy the latest Code.gs (new version) to it, then try again. Use “Check all databases” to see which ones need updating.' : ''}</div>`;
     }
+  };
+
+  // ---- Stop exam ----
+  const stopExamBtn = document.getElementById('stopExamBtn');
+  if (stopExamBtn) stopExamBtn.onclick = async () => {
+    const examId = val('stopExamId');
+    const box = document.getElementById('stopExamResults');
+    if (!examId) { box.innerHTML = '<div class="error-msg">Enter the exam ID to stop.</div>'; return; }
+    if (!confirm('Stop this exam now? Every candidate still sitting will be ended immediately and shown that the exam has ended. Their attempts will be harvested for grading. This cannot be undone.')) return;
+    stopExamBtn.disabled = true;
+    box.innerHTML = '<div class="empty-state">Stopping the exam and harvesting attempts…</div>';
+    const r = await apiPost('stopExam', { examId });
+    stopExamBtn.disabled = false;
+    if (r && r.success) {
+      audit('stop_exam', `Stopped exam ${examId}; harvested ${r.harvested} in-progress attempt(s)`);
+      box.innerHTML = `<div class="sub" style="color:var(--success);"><strong>Exam stopped.</strong> ${r.harvested} in-progress attempt(s) were harvested and marked submitted for grading${r.skipped ? `, ${r.skipped} could not be processed and can be recovered with “Recover stuck sessions”` : ''}. Candidates still on screen will be notified within a few seconds. New attempts can no longer start.</div>`;
+    } else {
+      const reason = (r && r.error) ? r.error : 'No response from the selected database.';
+      const stale = /Unknown (POST|GET) action/i.test(reason);
+      box.innerHTML = `<div class="error-msg">Could not stop the exam: ${escapeHtml(reason)}${stale ? '<br><br>This database is running an older version that does not support this feature yet. Deploy the latest Code.gs (new version) to it, then try again.' : ''}</div>`;
+    }
+  };
+
+  // ---- Deployment safety check ----
+  const deploySafetyBtn = document.getElementById('deploySafetyBtn');
+  if (deploySafetyBtn) deploySafetyBtn.onclick = async () => {
+    const box = document.getElementById('deploySafetyResults');
+    const eps = configuredEndpoints();
+    if (!eps.length) { box.innerHTML = '<div class="empty-state">No databases configured.</div>'; return; }
+    box.innerHTML = `<div class="empty-state">Checking ${eps.length} database(s)…</div>`;
+
+    const results = await Promise.all(eps.map(async (ep) => {
+      try {
+        const res = await apiGetOn(ep.url, 'getActivityStatus', {});
+        if (res && res.success) return { label: ep.label, known: true, busy: res.busy, active: res.activeSessions, version: res.version || '' };
+        // Reachable but doesn't know the action -> older version.
+        return { label: ep.label, known: false, reachable: true };
+      } catch (e) {
+        return { label: ep.label, known: false, reachable: false };
+      }
+    }));
+
+    let html = '<div class="preview-wrap"><table><tr><th>Database</th><th>Status</th><th>Active now</th><th>Safe to deploy?</th></tr>';
+    results.forEach(r => {
+      let status, active, safe;
+      if (!r.known && !r.reachable) {
+        status = '<span class="badge badge-danger">unreachable</span>'; active = '—';
+        safe = '<span class="badge badge-warn">can’t tell — treat as busy</span>';
+      } else if (!r.known) {
+        status = '<span class="badge badge-warn">older version</span>'; active = '—';
+        safe = '<span class="badge badge-warn">can’t tell — treat as busy</span>';
+      } else if (r.busy) {
+        status = '<span class="badge badge-danger">busy</span>'; active = String(r.active);
+        safe = '<span class="badge badge-danger">NO — candidates sitting</span>';
+      } else {
+        status = '<span class="badge badge-ok">idle</span>'; active = '0';
+        safe = '<span class="badge badge-ok">YES — safe to deploy</span>';
+      }
+      html += `<tr><td>${escapeHtml(r.label)}</td><td>${status}</td><td>${active}</td><td>${safe}</td></tr>`;
+    });
+    html += '</table></div>';
+    box.innerHTML = html;
+    audit('deploy_safety_check', `Checked deploy-safety across ${eps.length} database(s)`);
   };
 
   let auditCache = null;
@@ -2329,6 +2423,43 @@ function startHeartbeat() {
       }
     }).catch(() => {});
   }, HEARTBEAT_INTERVAL_MS);
+
+  // Poll whether an administrator has stopped the exam. Runs more often than
+  // the heartbeat so that when the exam is stopped (e.g. at the 4pm cut-off),
+  // every candidate still sitting ends promptly. On a missed poll (bad
+  // connection) nothing happens; it simply checks again next tick, and the
+  // server-side harvest already captured their synced answers regardless.
+  state.examStopPollHandle = setInterval(() => {
+    if (state.examSubmitted) return;
+    apiGet('examStatus', { examId: state.exam.examId }).then(r => {
+      if (r && r.success && r.stopped && !state.examSubmitted) {
+        endExamBecauseStopped();
+      }
+    }).catch(() => {});
+  }, EXAM_STOP_POLL_MS);
+}
+
+// The exam was stopped by an administrator while this candidate was sitting.
+// Lock immediately (network-independent), push their latest answers, and show
+// the "exam has ended" notice. Their attempt is also harvested server-side by
+// stopExam, so their work is safe even if this final push fails.
+function endExamBecauseStopped() {
+  if (state.examSubmitted) return;
+  state.examSubmitted = true;
+  state.examEndedByStop = true;
+  persistCurrentAnswer();
+  stopAllTimers();
+  detachProctoringListeners();
+  disengageLockdown();
+  const answersSnapshot = Object.entries(state.answers).map(([questionId, answer]) => ({ questionId, answer }));
+
+  state.currentView = 'examSubmitted';
+  render();
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+
+  submitFinalWithRetry(answersSnapshot).catch(() => {});
+  try { stopRecording(); } catch (e) {}
+  audit('exam_ended_by_admin', 'Exam ended by administrator; attempt harvested', state.exam.examId);
 }
 
 // ---------- RECORDING (camera/mic -> chunked upload to Drive) ----------
@@ -2359,7 +2490,7 @@ function setRecordingHealth(status) {
 // through the exact same pipeline real exam chunks use. Returns {ok, reason}.
 // This proves camera capture, encoding, base64 transport, Apps Script, and
 // Drive write all work end-to-end before the exam is allowed to begin.
-const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.4';
+const REQUIRED_BACKEND_VERSION_PREFIX = 'v3.5';
 
 async function runRecordingPreflight() {
   // Step 1: confirm the LIVE backend is running current code. A stale
@@ -2707,6 +2838,7 @@ function stopAllTimers() {
   if (state.timerHandle) clearInterval(state.timerHandle);
   if (state.syncHandle) clearInterval(state.syncHandle);
   if (state.heartbeatHandle) clearInterval(state.heartbeatHandle);
+  if (state.examStopPollHandle) clearInterval(state.examStopPollHandle);
   if (state.faceMonitorHandle) clearInterval(state.faceMonitorHandle);
 }
 
@@ -2814,6 +2946,15 @@ async function startFaceMonitor() {
 }
 
 function renderSubmitted() {
+  if (state.examEndedByStop) {
+    return `
+    <div class="card" style="text-align:center; padding:50px 20px;">
+      <div style="font-size:40px;">🛑</div>
+      <h2>The exam has ended</h2>
+      <p class="sub">The examination has been ended by the administrator. Everything you attempted has been received and will be sent for grading. You can no longer make changes; it is safe to close this window.</p>
+    </div>
+  `;
+  }
   return `
     <div class="card" style="text-align:center; padding:50px 20px;">
       <div style="font-size:40px;">✅</div>
