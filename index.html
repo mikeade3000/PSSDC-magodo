@@ -876,6 +876,18 @@ function renderAdmin() {
       <button class="btn btn-outline" id="resetAttemptBtn" style="margin-top:16px;">Allow retake</button>
       <div id="resetAttemptMsg"></div>
     </div>
+
+    <div class="card">
+      <h2>Recover stuck sessions</h2>
+      <div class="sub">If a candidate finished but a poor connection stopped their submission from registering, or their connection dropped mid-exam and never returned, their session can stay marked "in progress". This finalises such sessions using the answers they had already synced. It only ever touches sessions whose exam time is already up \u2014 it can never disturb a candidate who is still genuinely sitting.</div>
+      <label>Exam ID</label>
+      <input type="text" id="staleExamId" placeholder="Paste the exam ID to check" />
+      <div style="margin-top:12px;">
+        <button class="btn btn-outline btn-sm" id="checkStaleBtn">Check for stuck sessions</button>
+        <button class="btn btn-gold btn-sm" id="finalizeStaleBtn" style="margin-left:8px;">Finalise stuck sessions</button>
+      </div>
+      <div id="staleResults" style="margin-top:12px;"></div>
+    </div>
   `;
 }
 
@@ -1105,6 +1117,41 @@ function attachAdminHandlers() {
     if (!examId || !candidateId) { msg('resetAttemptMsg', 'Both fields are required.', true); return; }
     const r = await apiPost('resetCandidateAttempt', { examId, candidateId });
     msg('resetAttemptMsg', r.success ? r.message : r.error, !r.success);
+  };
+
+  const checkStaleBtn = document.getElementById('checkStaleBtn');
+  if (checkStaleBtn) checkStaleBtn.onclick = async () => {
+    const examId = val('staleExamId');
+    const box = document.getElementById('staleResults');
+    if (!examId) { box.innerHTML = '<div class="error-msg">Enter an exam ID first.</div>'; return; }
+    box.innerHTML = '<div class="empty-state">Checking…</div>';
+    const r = await apiGet('getStaleSessions', { examId });
+    if (!r || !r.success) { box.innerHTML = '<div class="error-msg">Could not check this exam in the current database.</div>'; return; }
+    if (!r.count) { box.innerHTML = '<div class="sub" style="color:var(--success);">No stuck sessions — every in-progress session for this exam is either still live or already submitted.</div>'; return; }
+    let html = `<div class="sub"><strong>${r.count}</strong> stuck session(s) found (exam time already elapsed):</div>`;
+    html += '<div class="preview-wrap"><table><tr><th>Candidate</th><th>Started</th><th>Silent for</th></tr>';
+    r.staleSessions.forEach(s => {
+      const name = s.fullName ? `${s.fullName} (${s.candidateId})` : s.candidateId;
+      html += `<tr><td>${escapeHtml(name)}</td><td>${s.startedAt ? new Date(s.startedAt).toLocaleString() : '—'}</td><td>${s.minutesSilent} min</td></tr>`;
+    });
+    html += '</table></div><div class="sub" style="margin-top:8px;">Choose <strong>Finalise stuck sessions</strong> to submit these using each candidate\u2019s already-synced answers.</div>';
+    box.innerHTML = html;
+  };
+
+  const finalizeStaleBtn = document.getElementById('finalizeStaleBtn');
+  if (finalizeStaleBtn) finalizeStaleBtn.onclick = async () => {
+    const examId = val('staleExamId');
+    const box = document.getElementById('staleResults');
+    if (!examId) { box.innerHTML = '<div class="error-msg">Enter an exam ID first.</div>'; return; }
+    if (!confirm('Finalise all stuck sessions for this exam? This submits them using the answers already saved, and only affects sessions whose exam time is already up.')) return;
+    box.innerHTML = '<div class="empty-state">Finalising…</div>';
+    const r = await apiPost('finalizeStaleSessions', { examId });
+    if (r && r.success) {
+      audit('finalize_stale_sessions', `Finalised ${r.finalised} stuck session(s) for ${examId}`);
+      box.innerHTML = `<div class="sub" style="color:var(--success);"><strong>${r.finalised}</strong> session(s) finalised and marked submitted. Reload the exam in the Examiner view to see them.</div>`;
+    } else {
+      box.innerHTML = '<div class="error-msg">Could not finalise sessions in the current database.</div>';
+    }
   };
 
   let auditCache = null;
@@ -1502,6 +1549,16 @@ function attachExaminerHandlers() {
     if (!examId) return;
     const resultsBody = document.getElementById('monitorResults');
     resultsBody.innerHTML = '<div class="card"><div class="empty-state">Loading…</div></div>';
+
+    // Auto-recover stuck sessions on load: any candidate whose exam time is
+    // fully up but whose session is still 'in_progress' (e.g. their connection
+    // dropped mid-exam and never returned, or the final submit never reached
+    // the server) is finalised now, using the answers they already synced.
+    // This runs quietly before the report is fetched, so the examiner always
+    // sees an accurate, up-to-date picture without pressing anything. It only
+    // ever affects sessions whose time has elapsed, so it can never disturb a
+    // candidate still legitimately sitting.
+    try { await apiPost('finalizeStaleSessions', { examId }); } catch (e) { /* non-blocking */ }
 
     const [reportRes, violationsRes, recordingsRes, snapshotsRes] = await Promise.all([
       apiGet('getExamReport', { examId }),
@@ -2609,18 +2666,41 @@ async function submitExam() {
 
   // ---- BACKGROUND FINALISATION (may take time on a slow link) ----
   // Runs after the candidate is already locked out, so its speed is irrelevant
-  // to integrity. The local copy is retained until the server confirms.
-  try {
-    await apiPost('submitFinalAnswers', { examId: state.exam.examId, candidateId: state.user.userId, answers: answersSnapshot });
-    localStorage.removeItem(LOCAL_KEY_PREFIX + state.exam.examId + '_' + state.user.userId);
-  } catch (e) {
-    // Sync failed (e.g. connection dropped). The answers remain saved locally
-    // and the session will be finalised server-side when time expires or on a
-    // later sync; the candidate stays locked out either way.
-  }
+  // to integrity. Retries persistently so a connection hiccup at the moment of
+  // submit does NOT leave the session stranded as 'in_progress'. The local
+  // copy is kept until the server confirms; the confirmation screen already
+  // tells the candidate it is safe to wait or close.
+  submitFinalWithRetry(state.exam.examId, state.user.userId, answersSnapshot);
 
   stopRecording();
   audit('exam_submitted', 'Exam submitted and locked', state.exam.examId);
+}
+
+// Keeps trying to deliver the final submission until the server confirms it,
+// with backoff. Handles failure mode (1): the final call failing on a poor
+// connection. Because the candidate is already locked out, this can run for
+// as long as the tab stays open without any integrity impact. If the tab is
+// closed before it succeeds, the server-side stale-session recovery (and the
+// admin cleanup tool) finalise the session after the exam's time is up, so
+// the answers already synced during the exam are never lost.
+async function submitFinalWithRetry(examId, candidateId, answersSnapshot) {
+  const delaysMs = [0, 3000, 8000, 15000, 30000, 60000, 120000]; // ~4 min of attempts
+  for (let attempt = 0; attempt < delaysMs.length; attempt++) {
+    if (delaysMs[attempt] > 0) await new Promise(r => setTimeout(r, delaysMs[attempt]));
+    try {
+      const res = await apiPost('submitFinalAnswers', { examId, candidateId, answers: answersSnapshot }, 30000);
+      if (res && (res.success || res.alreadySubmitted)) {
+        // Confirmed on the server (or already submitted) — safe to clear local.
+        try { localStorage.removeItem(LOCAL_KEY_PREFIX + examId + '_' + candidateId); } catch (e) {}
+        return;
+      }
+      // A definite non-success response that isn't "already submitted" — keep trying.
+    } catch (e) {
+      // Network/timeout — keep trying on the next backoff step.
+    }
+  }
+  // Exhausted quick retries. Leave the local copy in place; the server-side
+  // recovery net will finalise this session once the exam time elapses.
 }
 
 function stopAllTimers() {
